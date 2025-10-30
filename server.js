@@ -129,4 +129,163 @@ async function callFlexible({ base, key, modelName, messages, prompt }) {
     const url = `${normalizedBase}${p}`;
     for (const b of bodies) {
       const r = await fetch(url, {
-        method:
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(key ? { authorization: `Bearer ${key}` } : {})
+        },
+        body: JSON.stringify(b)
+      }).catch(() => null);
+      if (r && r.ok) {
+        const text = await toTextFromAny(r);
+        return { ok: true, text, tried: { url, body: b } };
+      }
+    }
+  }
+  return { ok: false, error: `No flexible path matched for base=${base}` };
+}
+
+/* ---------- /v1/models ---------- */
+app.get('/v1/models', (_req, res) => {
+  res.json({
+    object: 'list',
+    data: [
+      { id: 'arkaios', object: 'model', owned_by: 'arkaios' },
+      { id: 'aida', object: 'model', owned_by: 'aida' }
+    ]
+  });
+});
+
+/* ---------- /v1/chat/completions ---------- */
+app.post('/v1/chat/completions', async (req, res) => {
+  try {
+    const { model = 'arkaios', messages = [], stream = false } = req.body || {};
+    const backend = pickBackend(model);
+
+    if (!backend.base) {
+      return res.status(500).json({ error: `Backend base URL missing for ${backend.name}` });
+    }
+
+    if (backend.openai) {
+      // Modo OpenAI directo
+      const r = await callOpenAIStyle({
+        base: backend.base,
+        key: backend.key,
+        modelName: backend.name,
+        messages,
+        stream
+      });
+
+      if (stream) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        r.body.pipe(res);
+        return;
+      }
+      const dataText = await r.text();
+      if (!r.ok) return res.status(r.status).send(dataText);
+      return res.type('application/json').send(dataText);
+    }
+
+    // Modo flexible: mapea respuesta a OpenAI
+    const out = await callFlexible({
+      base: backend.base,
+      key: backend.key,
+      modelName: backend.name,
+      messages
+    });
+    if (!out.ok) return res.status(502).json({ error: out.error });
+
+    return res.json({
+      id: `${backend.name}-chat`,
+      object: 'chat.completion',
+      choices: [{
+        index: 0,
+        message: { role: 'assistant', content: out.text },
+        finish_reason: 'stop'
+      }]
+    });
+
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+/* ---------- /v1/completions ---------- */
+app.post('/v1/completions', async (req, res) => {
+  try {
+    const { model = 'arkaios', prompt = '', stream = false } = req.body || {};
+    const backend = pickBackend(model);
+
+    if (!backend.base) {
+      return res.status(500).json({ error: `Backend base URL missing for ${backend.name}` });
+    }
+
+    if (backend.openai) {
+      const r = await callOpenAIStyle({
+        base: backend.base,
+        key: backend.key,
+        modelName: backend.name,
+        prompt,
+        stream
+      });
+      if (stream) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        r.body.pipe(res);
+        return;
+      }
+      const dataText = await r.text();
+      if (!r.ok) return res.status(r.status).send(dataText);
+      return res.type('application/json').send(dataText);
+    }
+
+    // Flexible
+    const out = await callFlexible({
+      base: backend.base,
+      key: backend.key,
+      modelName: backend.name,
+      prompt
+    });
+    if (!out.ok) return res.status(502).json({ error: out.error });
+
+    return res.json({
+      id: `${backend.name}-completion`,
+      object: 'text_completion',
+      choices: [{ index: 0, text: out.text, finish_reason: 'stop' }]
+    });
+
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+/* ---------- Debug ---------- */
+app.get('/debug/ping', async (_req, res) => {
+  async function probe(name, base, key) {
+    if (!base) return { name, ok: false, error: 'no base url' };
+    const url = `${base.replace(/\/+$/,'')}/healthz`;
+    try {
+      const r = await fetch(url, {
+        headers: { ...(key ? { authorization: `Bearer ${key}` } : {}) }
+      });
+      const text = await r.text();
+      return { name, ok: r.ok, status: r.status, url, body: text.slice(0, 500) };
+    } catch (e) {
+      return { name, ok: false, error: String(e) };
+    }
+  }
+  const report = {
+    arkaios: await probe('arkaios', ARKAIOS_BASE_URL, ARKAIOS_INTERNAL_KEY),
+    aida: await probe('aida', AIDA_BASE_URL, AIDA_INTERNAL_KEY)
+  };
+  res.json(report);
+});
+
+/* ---------- Rutas libres ---------- */
+app.get('/', (_req, res) => {
+  res.send('ARKAIOS Service Proxy (OpenAI compatible). Ready.');
+});
+app.get('/healthz', (_req, res) => res.json({ ok: true }));
+
+app.listen(PORT, () => console.log(`Proxy on :${PORT}`));
