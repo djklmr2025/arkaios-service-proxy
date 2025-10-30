@@ -13,16 +13,26 @@ const {
   PORT = 4000,
   PROXY_API_KEY,
 
+  // ARKAIOS
   ARKAIOS_BASE_URL,
   ARKAIOS_INTERNAL_KEY,
-  ARKAIOS_OPENAI = 'false',   // <-- controla modo
+  ARKAIOS_OPENAI = 'false',         // true = usa /v1/chat/completions
+  ARKAIOS_PATH = '/api/chat',       // ruta flexible
+  ARKAIOS_REQ_FIELD = 'input',      // nombre del campo del prompt: input|prompt|message|text
+  ARKAIOS_RESP_PATH = 'data.text',  // dot-path para extraer texto
 
+  // AIDA
   AIDA_BASE_URL,
   AIDA_INTERNAL_KEY,
-  AIDA_OPENAI = 'false'       // <-- controla modo
+  AIDA_OPENAI = 'false',
+  AIDA_PATH = '/api/chat',
+  AIDA_REQ_FIELD = 'input',
+  AIDA_RESP_PATH = 'data.text',
 } = process.env;
 
-/* ---------- Auth SOLO para /v1/* ---------- */
+const asBool = (v) => String(v || '').toLowerCase() === 'true';
+
+/* ------------ Auth SOLO /v1/* ------------ */
 const authMiddleware = (req, res, next) => {
   const auth = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
@@ -31,151 +41,87 @@ const authMiddleware = (req, res, next) => {
 };
 app.use('/v1', authMiddleware);
 
-/* ---------- Utils ---------- */
-const asBool = (v) => String(v || '').toLowerCase() === 'true';
+/* ------------ Helpers ------------ */
+const dotGet = (obj, path) => {
+  if (!path) return undefined;
+  return path.split('.').reduce((acc, k) => (acc && acc[k] !== undefined ? acc[k] : undefined), obj);
+};
 
-function pickBackend(modelId) {
+function pick(modelId) {
   const m = (modelId || '').toLowerCase();
   if (m === 'aida') {
     return {
       name: 'aida',
-      base: AIDA_BASE_URL,
+      base: (AIDA_BASE_URL || '').replace(/\/+$/,''),
       key: AIDA_INTERNAL_KEY,
-      openai: asBool(AIDA_OPENAI)
+      openai: asBool(AIDA_OPENAI),
+      path: AIDA_PATH,
+      reqField: AIDA_REQ_FIELD,
+      respPath: AIDA_RESP_PATH,
     };
   }
   return {
     name: 'arkaios',
-    base: ARKAIOS_BASE_URL,
-    key: ARKAIOS_INTERNAL_KEY,
-    openai: asBool(ARKAIOS_OPENAI)
+      base: (ARKAIOS_BASE_URL || '').replace(/\/+$/,''),
+      key: ARKAIOS_INTERNAL_KEY,
+      openai: asBool(ARKAIOS_OPENAI),
+      path: ARKAIOS_PATH,
+      reqField: ARKAIOS_REQ_FIELD,
+      respPath: ARKAIOS_RESP_PATH,
   };
 }
 
-/* ---------- Normalizadores de respuesta ---------- */
-async function toTextFromAny(resp) {
-  // Intenta JSON; si truena, devuelve texto bruto
-  let text = await resp.text();
-  try {
-    const data = JSON.parse(text);
-
-    // OpenAI chat
-    if (data?.choices?.[0]?.message?.content) {
-      return data.choices[0].message.content;
-    }
-    // OpenAI completions (text)
-    if (data?.choices?.[0]?.text) {
-      return data.choices[0].text;
-    }
-    // Campos comunes
-    if (typeof data.reply === 'string') return data.reply;
-    if (typeof data.response === 'string') return data.response;
-    if (typeof data.message === 'string') return data.message;
-    if (typeof data.text === 'string') return data.text;
-    if (typeof data.content === 'string') return data.content;
-
-    // Algunos backends devuelven {data:{text:...}}
-    if (typeof data?.data?.text === 'string') return data.data.text;
-    if (typeof data?.data?.content === 'string') return data.data.content;
-
-    // Como último recurso, re-serializa bonito
-    return JSON.stringify(data);
-  } catch {
-    return text;
-  }
-}
-
-/* ---------- Caller OpenAI-like ---------- */
-async function callOpenAIStyle({ base, key, modelName, messages, prompt, stream }) {
-  const url = `${base.replace(/\/+$/,'')}/v1/chat/completions`;
+async function callOpenAI({ base, key, modelName, messages, prompt, stream }) {
+  const url = `${base}/v1/chat/completions`;
   const body = messages ? { model: modelName, messages, stream: !!stream }
                         : { model: modelName, prompt, stream: !!stream };
+  return fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(key ? { authorization: `Bearer ${key}` } : {}) },
+    body: JSON.stringify(body),
+  });
+}
 
+async function callCustom({ base, key, path, reqField, payload }) {
+  const url = `${base}${path.startsWith('/') ? path : `/${path}`}`;
+  const body = { [reqField]: payload, model: 'custom' };
   const r = await fetch(url, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      ...(key ? { authorization: `Bearer ${key}` } : {})
-    },
-    body: JSON.stringify(body)
+    headers: { 'content-type': 'application/json', ...(key ? { authorization: `Bearer ${key}` } : {}) },
+    body: JSON.stringify(body),
   });
-  return r;
+  const text = await r.text();
+  return { ok: r.ok, status: r.status, text, url };
 }
 
-/* ---------- Caller Flexible (no OpenAI) ---------- */
-async function callFlexible({ base, key, modelName, messages, prompt }) {
-  const last = messages?.length ? messages[messages.length - 1].content : (prompt || '');
-  const normalizedBase = base?.replace(/\/+$/,'') || '';
-
-  // Variantes de payload comunes
-  const bodies = [
-    { input: last, model: modelName },
-    { query: last, model: modelName },
-    { prompt: last, model: modelName },
-    { message: last, model: modelName },
-    { text: last, model: modelName }
-  ];
-  // Rutas candidatas
-  const paths = [
-    '/chat',
-    '/api/chat',
-    '/message',
-    '/api/message',
-    '/gateway/chat',
-    '/v1/chat' // algunos usan esta sin "completions"
-  ];
-
-  for (const p of paths) {
-    const url = `${normalizedBase}${p}`;
-    for (const b of bodies) {
-      const r = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          ...(key ? { authorization: `Bearer ${key}` } : {})
-        },
-        body: JSON.stringify(b)
-      }).catch(() => null);
-      if (r && r.ok) {
-        const text = await toTextFromAny(r);
-        return { ok: true, text, tried: { url, body: b } };
-      }
-    }
-  }
-  return { ok: false, error: `No flexible path matched for base=${base}` };
+function toOpenAIChat(text) {
+  return {
+    id: 'proxy-chat',
+    object: 'chat.completion',
+    choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
+  };
 }
 
-/* ---------- /v1/models ---------- */
+/* ------------ /v1/models ------------ */
 app.get('/v1/models', (_req, res) => {
   res.json({
     object: 'list',
     data: [
       { id: 'arkaios', object: 'model', owned_by: 'arkaios' },
-      { id: 'aida', object: 'model', owned_by: 'aida' }
-    ]
+      { id: 'aida', object: 'model', owned_by: 'aida' },
+    ],
   });
 });
 
-/* ---------- /v1/chat/completions ---------- */
+/* ------------ /v1/chat/completions ------------ */
 app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model = 'arkaios', messages = [], stream = false } = req.body || {};
-    const backend = pickBackend(model);
+    const b = pick(model);
+    if (!b.base) return res.status(500).json({ error: `Missing base URL for ${b.name}` });
 
-    if (!backend.base) {
-      return res.status(500).json({ error: `Backend base URL missing for ${backend.name}` });
-    }
-
-    if (backend.openai) {
-      // Modo OpenAI directo
-      const r = await callOpenAIStyle({
-        base: backend.base,
-        key: backend.key,
-        modelName: backend.name,
-        messages,
-        stream
-      });
-
+    if (b.openai) {
+      const r = await callOpenAI({ base: b.base, key: b.key, modelName: b.name, messages, stream });
       if (stream) {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
@@ -183,109 +129,84 @@ app.post('/v1/chat/completions', async (req, res) => {
         return;
       }
       const dataText = await r.text();
-      if (!r.ok) return res.status(r.status).send(dataText);
-      return res.type('application/json').send(dataText);
+      return r.ok ? res.type('application/json').send(dataText) : res.status(r.status).send(dataText);
     }
 
-    // Modo flexible: mapea respuesta a OpenAI
-    const out = await callFlexible({
-      base: backend.base,
-      key: backend.key,
-      modelName: backend.name,
-      messages
-    });
-    if (!out.ok) return res.status(502).json({ error: out.error });
+    // flexible
+    const last = messages?.length ? messages[messages.length - 1].content : '';
+    const { ok, status, text, url } = await callCustom({ base: b.base, key: b.key, path: b.path, reqField: b.reqField, payload: last });
 
-    return res.json({
-      id: `${backend.name}-chat`,
-      object: 'chat.completion',
-      choices: [{
-        index: 0,
-        message: { role: 'assistant', content: out.text },
-        finish_reason: 'stop'
-      }]
-    });
+    if (!ok) return res.status(502).json({ error: `Backend ${b.name} ${status} @ ${url}`, body: text.slice(0,500) });
 
+    let out = text;
+    try {
+      const json = JSON.parse(text);
+      const picked = dotGet(json, b.respPath);
+      if (typeof picked === 'string') out = picked;
+      else if (typeof json.reply === 'string') out = json.reply;
+      else if (typeof json.response === 'string') out = json.response;
+      else if (typeof json.message === 'string') out = json.message;
+      else if (typeof json.text === 'string') out = json.text;
+      else if (typeof json.content === 'string') out = json.content;
+      else out = JSON.stringify(json);
+    } catch { /* se queda text */ }
+
+    return res.json(toOpenAIChat(out));
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-/* ---------- /v1/completions ---------- */
+/* ------------ /v1/completions ------------ */
 app.post('/v1/completions', async (req, res) => {
   try {
     const { model = 'arkaios', prompt = '', stream = false } = req.body || {};
-    const backend = pickBackend(model);
+    const b = pick(model);
+    if (!b.base) return res.status(500).json({ error: `Missing base URL for ${b.name}` });
 
-    if (!backend.base) {
-      return res.status(500).json({ error: `Backend base URL missing for ${backend.name}` });
-    }
-
-    if (backend.openai) {
-      const r = await callOpenAIStyle({
-        base: backend.base,
-        key: backend.key,
-        modelName: backend.name,
-        prompt,
-        stream
-      });
-      if (stream) {
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        r.body.pipe(res);
-        return;
-      }
+    if (b.openai) {
+      const r = await callOpenAI({ base: b.base, key: b.key, modelName: b.name, prompt, stream });
       const dataText = await r.text();
-      if (!r.ok) return res.status(r.status).send(dataText);
-      return res.type('application/json').send(dataText);
+      return r.ok ? res.type('application/json').send(dataText) : res.status(r.status).send(dataText);
     }
 
-    // Flexible
-    const out = await callFlexible({
-      base: backend.base,
-      key: backend.key,
-      modelName: backend.name,
-      prompt
-    });
-    if (!out.ok) return res.status(502).json({ error: out.error });
+    const { ok, status, text, url } = await callCustom({ base: b.base, key: b.key, path: b.path, reqField: b.reqField, payload: prompt });
+    if (!ok) return res.status(502).json({ error: `Backend ${b.name} ${status} @ ${url}`, body: text.slice(0,500) });
 
-    return res.json({
-      id: `${backend.name}-completion`,
-      object: 'text_completion',
-      choices: [{ index: 0, text: out.text, finish_reason: 'stop' }]
-    });
-
+    // similar mapping
+    let out = text;
+    try {
+      const json = JSON.parse(text);
+      const picked = dotGet(json, b.respPath);
+      out = typeof picked === 'string' ? picked : (json.text || json.response || json.reply || json.content || JSON.stringify(json));
+    } catch {}
+    return res.json({ id: 'proxy-txt', object: 'text_completion', choices: [{ index: 0, text: out, finish_reason: 'stop' }] });
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-/* ---------- Debug ---------- */
+/* ------------ Debug ------------ */
 app.get('/debug/ping', async (_req, res) => {
-  async function probe(name, base, key) {
+  async function probe(name, base) {
     if (!base) return { name, ok: false, error: 'no base url' };
     const url = `${base.replace(/\/+$/,'')}/healthz`;
     try {
-      const r = await fetch(url, {
-        headers: { ...(key ? { authorization: `Bearer ${key}` } : {}) }
-      });
+      const r = await fetch(url);
       const text = await r.text();
-      return { name, ok: r.ok, status: r.status, url, body: text.slice(0, 500) };
+      return { name, ok: r.ok, status: r.status, url, body: text.slice(0, 400) };
     } catch (e) {
       return { name, ok: false, error: String(e) };
     }
   }
-  const report = {
-    arkaios: await probe('arkaios', ARKAIOS_BASE_URL, ARKAIOS_INTERNAL_KEY),
-    aida: await probe('aida', AIDA_BASE_URL, AIDA_INTERNAL_KEY)
-  };
-  res.json(report);
+  res.json({
+    arkaios: await probe('arkaios', ARKAIOS_BASE_URL),
+    aida: await probe('aida', AIDA_BASE_URL)
+  });
 });
 
-/* ---------- Rutas libres ---------- */
-app.get('/', (_req, res) => {
-  res.send('ARKAIOS Service Proxy (OpenAI compatible). Ready.');
-});
+/* ------------ Rutas libres ------------ */
+app.get('/', (_req, res) => res.send('ARKAIOS Service Proxy (OpenAI compatible). Ready.'));
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
 app.listen(PORT, () => console.log(`Proxy on :${PORT}`));
