@@ -12,13 +12,17 @@ app.use(morgan('dev'));
 const {
   PORT = 4000,
   PROXY_API_KEY,
+
   ARKAIOS_BASE_URL,
   ARKAIOS_INTERNAL_KEY,
+  ARKAIOS_OPENAI = 'false',   // <-- controla modo
+
   AIDA_BASE_URL,
-  AIDA_INTERNAL_KEY
+  AIDA_INTERNAL_KEY,
+  AIDA_OPENAI = 'false'       // <-- controla modo
 } = process.env;
 
-/* --- Auth SOLO para /v1/* --- */
+/* ---------- Auth SOLO para /v1/* ---------- */
 const authMiddleware = (req, res, next) => {
   const auth = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
@@ -27,29 +31,65 @@ const authMiddleware = (req, res, next) => {
 };
 app.use('/v1', authMiddleware);
 
-/* --- OpenAI-compatible --- */
-app.get('/v1/models', (_req, res) => {
-  res.json({
-    object: 'list',
-    data: [
-      { id: 'arkaios', object: 'model', owned_by: 'arkaios' },
-      { id: 'aida', object: 'model', owned_by: 'aida' }
-    ]
-  });
-});
+/* ---------- Utils ---------- */
+const asBool = (v) => String(v || '').toLowerCase() === 'true';
 
 function pickBackend(modelId) {
-  if ((modelId || '').toLowerCase() === 'aida') {
-    return { base: AIDA_BASE_URL, key: AIDA_INTERNAL_KEY, name: 'aida' };
+  const m = (modelId || '').toLowerCase();
+  if (m === 'aida') {
+    return {
+      name: 'aida',
+      base: AIDA_BASE_URL,
+      key: AIDA_INTERNAL_KEY,
+      openai: asBool(AIDA_OPENAI)
+    };
   }
-  return { base: ARKAIOS_BASE_URL, key: ARKAIOS_INTERNAL_KEY, name: 'arkaios' };
+  return {
+    name: 'arkaios',
+    base: ARKAIOS_BASE_URL,
+    key: ARKAIOS_INTERNAL_KEY,
+    openai: asBool(ARKAIOS_OPENAI)
+  };
 }
 
-async function callBackend({ model, messages, prompt, stream }) {
-  const { base, key, name } = pickBackend(model);
-  const url = `${base}/v1/chat/completions`;
-  const body = messages ? { model: name, messages, stream: !!stream }
-                        : { model: name, prompt, stream: !!stream };
+/* ---------- Normalizadores de respuesta ---------- */
+async function toTextFromAny(resp) {
+  // Intenta JSON; si truena, devuelve texto bruto
+  let text = await resp.text();
+  try {
+    const data = JSON.parse(text);
+
+    // OpenAI chat
+    if (data?.choices?.[0]?.message?.content) {
+      return data.choices[0].message.content;
+    }
+    // OpenAI completions (text)
+    if (data?.choices?.[0]?.text) {
+      return data.choices[0].text;
+    }
+    // Campos comunes
+    if (typeof data.reply === 'string') return data.reply;
+    if (typeof data.response === 'string') return data.response;
+    if (typeof data.message === 'string') return data.message;
+    if (typeof data.text === 'string') return data.text;
+    if (typeof data.content === 'string') return data.content;
+
+    // Algunos backends devuelven {data:{text:...}}
+    if (typeof data?.data?.text === 'string') return data.data.text;
+    if (typeof data?.data?.content === 'string') return data.data.content;
+
+    // Como último recurso, re-serializa bonito
+    return JSON.stringify(data);
+  } catch {
+    return text;
+  }
+}
+
+/* ---------- Caller OpenAI-like ---------- */
+async function callOpenAIStyle({ base, key, modelName, messages, prompt, stream }) {
+  const url = `${base.replace(/\/+$/,'')}/v1/chat/completions`;
+  const body = messages ? { model: modelName, messages, stream: !!stream }
+                        : { model: modelName, prompt, stream: !!stream };
 
   const r = await fetch(url, {
     method: 'POST',
@@ -59,49 +99,34 @@ async function callBackend({ model, messages, prompt, stream }) {
     },
     body: JSON.stringify(body)
   });
-  if (!r.ok) {
-    const t = await r.text().catch(() => '');
-    throw new Error(`Backend ${name} ${r.status}: ${t}`);
-  }
   return r;
 }
 
-app.post('/v1/chat/completions', async (req, res) => {
-  try {
-    const { model = 'arkaios', messages = [], stream = false } = req.body || {};
-    const r = await callBackend({ model, messages, stream });
-    if (stream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      r.body.pipe(res);
-      return;
-    }
-    res.json(await r.json());
-  } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
-  }
-});
+/* ---------- Caller Flexible (no OpenAI) ---------- */
+async function callFlexible({ base, key, modelName, messages, prompt }) {
+  const last = messages?.length ? messages[messages.length - 1].content : (prompt || '');
+  const normalizedBase = base?.replace(/\/+$/,'') || '';
 
-app.post('/v1/completions', async (req, res) => {
-  try {
-    const { model = 'arkaios', prompt = '', stream = false } = req.body || {};
-    const r = await callBackend({ model, prompt, stream });
-    if (stream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      r.body.pipe(res);
-      return;
-    }
-    res.json(await r.json());
-  } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
-  }
-});
+  // Variantes de payload comunes
+  const bodies = [
+    { input: last, model: modelName },
+    { query: last, model: modelName },
+    { prompt: last, model: modelName },
+    { message: last, model: modelName },
+    { text: last, model: modelName }
+  ];
+  // Rutas candidatas
+  const paths = [
+    '/chat',
+    '/api/chat',
+    '/message',
+    '/api/message',
+    '/gateway/chat',
+    '/v1/chat' // algunos usan esta sin "completions"
+  ];
 
-/* --- Rutas libres (sin auth) --- */
-app.get('/', (_req, res) => {
-  res.send('ARKAIOS Service Proxy (OpenAI compatible). Ready.');
-});
-app.get('/healthz', (_req, res) => res.json({ ok: true }));
-
-app.listen(PORT, () => console.log(`Proxy on :${PORT}`));
+  for (const p of paths) {
+    const url = `${normalizedBase}${p}`;
+    for (const b of bodies) {
+      const r = await fetch(url, {
+        method:
