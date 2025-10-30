@@ -18,13 +18,16 @@ const {
   AIDA_INTERNAL_KEY
 } = process.env;
 
-app.use((req, res, next) => {
+/* --- Auth SOLO para /v1/* --- */
+const authMiddleware = (req, res, next) => {
   const auth = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
   if (!PROXY_API_KEY || token === PROXY_API_KEY) return next();
   res.status(401).json({ error: 'Invalid API key' });
-});
+};
+app.use('/v1', authMiddleware);
 
+/* --- OpenAI-compatible --- */
 app.get('/v1/models', (_req, res) => {
   res.json({
     object: 'list',
@@ -95,5 +98,10 @@ app.post('/v1/completions', async (req, res) => {
   }
 });
 
-app.get('/', (_req, res) => res.send('ARKAIOS Service Proxy (OpenAI compatible). Ready.'));
+/* --- Rutas libres (sin auth) --- */
+app.get('/', (_req, res) => {
+  res.send('ARKAIOS Service Proxy (OpenAI compatible). Ready.');
+});
+app.get('/healthz', (_req, res) => res.json({ ok: true }));
+
 app.listen(PORT, () => console.log(`Proxy on :${PORT}`));
