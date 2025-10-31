@@ -251,11 +251,23 @@ app.post('/v1/completions', async (req, res) => {
 app.get('/debug/ping', async (_req, res) => {
   async function probe(name, base) {
     if (!base) return { name, ok: false, error: 'no base url' };
-    const url = `${trimBase(base)}/healthz`;
+    const baseTrim = trimBase(base);
+    const urlHealth = `${baseTrim}/healthz`;
     try {
-      const r = await fetch(url);
-      const text = await r.text();
-      return { name, ok: r.ok, status: r.status, url, body: text.slice(0, 400) };
+      let r = await fetch(urlHealth);
+      let text = await r.text();
+      if (r.status === 404) {
+        // Fallback a raíz si /healthz no existe
+        const urlRoot = `${baseTrim}/`;
+        try {
+          r = await fetch(urlRoot);
+          text = await r.text();
+          return { name, ok: r.ok, status: r.status, url: urlRoot, body: text.slice(0, 400) };
+        } catch (e2) {
+          return { name, ok: false, status: r.status, url: urlHealth, body: text.slice(0, 400), error: String(e2) };
+        }
+      }
+      return { name, ok: r.ok, status: r.status, url: urlHealth, body: text.slice(0, 400) };
     } catch (e) {
       return { name, ok: false, error: String(e) };
     }
