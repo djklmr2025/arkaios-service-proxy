@@ -32,6 +32,11 @@ const {
   AIDA_AGENT_ID = 'puter',
   AIDA_ACTION = 'plan',
   AIDA_OBJECTIVE_FIELD = 'objective',
+  AIDA_RESP_PATH = 'data.text|result.note|result.text|text|reply|response',
+  // LAB MCP (wrapper HTTP)
+  LAB_MCP_BASE_URL,
+  LAB_MCP_PATH = '/mcp/run',
+  LAB_MCP_RESP_PATH = 'result.text|data.text|text|reply|response'
 } = process.env;
 
 const asBool = v => String(v || '').toLowerCase() === 'true';
@@ -49,6 +54,16 @@ app.use('/v1', authMiddleware);
 const dotGet = (obj, path) => {
   if (!path) return undefined;
   return path.split('.').reduce((acc, k) => (acc && acc[k] !== undefined ? acc[k] : undefined), obj);
+};
+// Permite definir múltiples rutas separadas por '|', devolviendo la primera que exista
+const pickPath = (obj, pathStr) => {
+  if (!pathStr) return undefined;
+  const candidates = String(pathStr).split('|').map(s => s.trim()).filter(Boolean);
+  for (const p of candidates) {
+    const val = dotGet(obj, p);
+    if (val !== undefined && val !== null) return val;
+  }
+  return undefined;
 };
 const trimBase = b => (b || '').replace(/\/+$/, '');
 
@@ -73,6 +88,17 @@ function pick(modelId) {
       // fallback custom
       reqField: 'input',
       respPath: 'data.text',
+    };
+  }
+  if (m === 'lab') {
+    return {
+      name: 'lab',
+      base: trimBase(LAB_MCP_BASE_URL || 'http://localhost:8090'),
+      openai: false,
+      mode: 'mcp',
+      path: LAB_MCP_PATH,
+      reqField: 'prompt',
+      respPath: LAB_MCP_RESP_PATH,
     };
   }
   // default arkaios
@@ -110,6 +136,19 @@ async function callCustom({ base, path, key, reqField, payload }) {
   return { ok: r.ok, status: r.status, text, url };
 }
 
+// Llamada específica al MCP HTTP wrapper
+async function callMCP({ base, path, payload }) {
+  const url = `${base}${path.startsWith('/') ? path : `/${path}`}`;
+  const body = { command: 'arkaios.chat', params: { prompt: payload } };
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const text = await r.text();
+  return { ok: r.ok, status: r.status, text, url };
+}
+
 function toOpenAIChat(text) {
   return {
     id: 'proxy-chat',
@@ -125,6 +164,7 @@ app.get('/v1/models', (_req, res) => {
     data: [
       { id: 'arkaios', object: 'model', owned_by: 'arkaios' },
       { id: 'aida', object: 'model', owned_by: 'aida' },
+      { id: 'lab', object: 'model', owned_by: 'arkaios-lab' },
     ],
   });
 });
@@ -166,11 +206,51 @@ app.post('/v1/chat/completions', async (req, res) => {
       const txt = await r.text();
       if (!r.ok) return res.status(502).json({ error: `Backend aida ${r.status} @ ${url}`, body: txt.slice(0, 600) });
 
-      // intenta parsear texto útil
+      // Humanizar salida AIDA
       let out = txt;
       try {
         const j = JSON.parse(txt);
-        out = j?.data?.text || j?.text || j?.reply || j?.response || j?.content || JSON.stringify(j);
+        const objective = dotGet(j, `result.params.${b.objectiveField}`) || dotGet(j, `params.${b.objectiveField}`);
+        const picked = pickPath(j, AIDA_RESP_PATH) || j?.content;
+        const steps = dotGet(j, 'result.steps') || dotGet(j, 'steps') || dotGet(j, 'result.plan') || dotGet(j, 'plan');
+        const note = dotGet(j, 'result.note') || j?.note || dotGet(j, 'data.text') || j?.text;
+        let parts = [];
+        if (objective) parts.push(`Objetivo: ${objective}`);
+        if (typeof picked === 'string' && picked) parts.push(picked);
+        else if (note) parts.push(`${note}`);
+        if (Array.isArray(steps) && steps.length) {
+          const list = steps.map((s, i) => `${i + 1}. ${typeof s === 'string' ? s : JSON.stringify(s)}`).join('\n');
+          parts.push(list);
+        }
+        out = parts.length ? parts.join('\n') : (typeof picked === 'string' ? picked : JSON.stringify(j));
+      } catch {}
+      return res.json(toOpenAIChat(out));
+    }
+
+    // ---- LAB MCP wrapper ----
+    if (b.name === 'lab' && b.mode === 'mcp') {
+      const { ok, status, text, url } = await callMCP({ base: b.base, path: b.path, payload: last });
+      if (!ok) return res.status(502).json({ error: `Backend lab ${status} @ ${url}`, body: text.slice(0, 600) });
+      let out = text;
+      try {
+        const j = JSON.parse(text);
+        // Humanización similar a AIDA, adaptada al wrapper MCP
+        const origin = dotGet(j, 'result.via') || j.via || undefined;
+        const payload = dotGet(j, 'result.reply') || j.reply || j.result || j;
+        const objective = dotGet(payload, 'result.params.objective') || dotGet(payload, 'params.objective');
+        const picked = pickPath(payload, b.respPath) || payload?.content;
+        const steps = dotGet(payload, 'result.steps') || dotGet(payload, 'steps') || dotGet(payload, 'result.plan') || dotGet(payload, 'plan');
+        const note = dotGet(payload, 'result.note') || payload?.note || dotGet(payload, 'data.text') || payload?.text;
+        let parts = [];
+        if (objective) parts.push(`Objetivo: ${objective}`);
+        if (typeof picked === 'string' && picked) parts.push(picked);
+        else if (note) parts.push(`${note}`);
+        if (Array.isArray(steps) && steps.length) {
+          const list = steps.map((s, i) => `${i + 1}. ${typeof s === 'string' ? s : JSON.stringify(s)}`).join('\n');
+          parts.push(list);
+        }
+        if (origin) parts.push(`via: ${origin}`);
+        out = parts.length ? parts.join('\n') : (typeof picked === 'string' ? picked : JSON.stringify(j));
       } catch {}
       return res.json(toOpenAIChat(out));
     }
@@ -185,7 +265,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     let out = text;
     try {
       const j = JSON.parse(text);
-      const picked = dotGet(j, b.respPath);
+      const picked = pickPath(j, b.respPath);
       out = typeof picked === 'string' ? picked :
             (j.text || j.reply || j.response || j.content || JSON.stringify(j));
     } catch {}
@@ -224,7 +304,31 @@ app.post('/v1/completions', async (req, res) => {
       let out = txt;
       try {
         const j = JSON.parse(txt);
-        out = j?.data?.text || j?.text || j?.reply || j?.response || j?.content || JSON.stringify(j);
+        const objective = dotGet(j, `result.params.${b.objectiveField}`) || dotGet(j, `params.${b.objectiveField}`);
+        const picked = pickPath(j, AIDA_RESP_PATH) || j?.content;
+        const steps = dotGet(j, 'result.steps') || dotGet(j, 'steps') || dotGet(j, 'result.plan') || dotGet(j, 'plan');
+        const note = dotGet(j, 'result.note') || j?.note || dotGet(j, 'data.text') || j?.text;
+        let parts = [];
+        if (objective) parts.push(`Objetivo: ${objective}`);
+        if (typeof picked === 'string' && picked) parts.push(picked);
+        else if (note) parts.push(`${note}`);
+        if (Array.isArray(steps) && steps.length) {
+          const list = steps.map((s, i) => `${i + 1}. ${typeof s === 'string' ? s : JSON.stringify(s)}`).join('\n');
+          parts.push(list);
+        }
+        out = parts.length ? parts.join('\n') : (typeof picked === 'string' ? picked : JSON.stringify(j));
+      } catch {}
+      return res.json({ id: 'proxy-txt', object: 'text_completion', choices: [{ index: 0, text: out, finish_reason: 'stop' }] });
+    }
+
+    if (b.name === 'lab' && b.mode === 'mcp') {
+      const { ok, status, text, url } = await callMCP({ base: b.base, path: b.path, payload: prompt });
+      if (!ok) return res.status(502).json({ error: `Backend lab ${status} @ ${url}`, body: text.slice(0, 600) });
+      let out = text;
+      try {
+        const j = JSON.parse(text);
+        const picked = pickPath(j, b.respPath);
+        out = typeof picked === 'string' ? picked : (j.text || j.reply || j.response || j.content || JSON.stringify(j));
       } catch {}
       return res.json({ id: 'proxy-txt', object: 'text_completion', choices: [{ index: 0, text: out, finish_reason: 'stop' }] });
     }
@@ -237,7 +341,7 @@ app.post('/v1/completions', async (req, res) => {
     let out = text;
     try {
       const j = JSON.parse(text);
-      const picked = dotGet(j, b.respPath);
+      const picked = pickPath(j, b.respPath);
       out = typeof picked === 'string' ? picked :
             (j.text || j.reply || j.response || j.content || JSON.stringify(j));
     } catch {}
