@@ -1,0 +1,71 @@
+npm warn Unknown env config "http-proxy". This will stop working in the next major version of npm.
+
+> arkaios-service-proxy@1.0.0 test:arkaios
+> tsx scripts/test-arkaios.ts
+
+
+--- Arkaios proxy smoke test (gpt-4.1-mini) ---
+Primary Arkaios smoke test failed:
+APIConnectionError: Connection error.
+    at OpenAI.makeRequest (/workspace/arkaios-service-proxy/node_modules/openai/src/client.ts:671:13)
+    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)
+    at async runSmokeTest (/workspace/arkaios-service-proxy/scripts/test-arkaios.ts:15:20)
+    at async main (/workspace/arkaios-service-proxy/scripts/test-arkaios.ts:51:5) {
+  status: undefined,
+  headers: undefined,
+  requestID: undefined,
+  error: undefined,
+  code: undefined,
+  param: undefined,
+  type: undefined,
+  cause: TypeError: fetch failed
+      at node:internal/deps/undici/undici:13510:13
+      at process.processTicksAndRejections (node:internal/process/task_queues:105:5)
+      at async OpenAI.fetchWithTimeout (/workspace/arkaios-service-proxy/node_modules/openai/src/client.ts:795:14)
+      at async OpenAI.makeRequest (/workspace/arkaios-service-proxy/node_modules/openai/src/client.ts:626:22)
+      at async runSmokeTest (/workspace/arkaios-service-proxy/scripts/test-arkaios.ts:15:20)
+      at async main (/workspace/arkaios-service-proxy/scripts/test-arkaios.ts:51:5) {
+    [cause]: AggregateError [ENETUNREACH]: 
+        at internalConnectMultiple (node:net:1134:18)
+        at internalConnectMultiple (node:net:1210:5)
+        at internalConnectMultiple (node:net:1210:5)
+        at defaultTriggerAsyncIdScope (node:internal/async_hooks:464:18)
+        at GetAddrInfoReqWrap.emitLookup [as callback] (node:net:1552:7)
+        at GetAddrInfoReqWrap.onlookupall [as oncomplete] (node:dns:134:8) {
+      code: 'ENETUNREACH',
+      [errors]: [Array]
+    }
+  }
+}
+Arkaios proxy smoke test exited with an error.
+APIConnectionError: Connection error.
+    at OpenAI.makeRequest (/workspace/arkaios-service-proxy/node_modules/openai/src/client.ts:671:13)
+    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)
+    at async runSmokeTest (/workspace/arkaios-service-proxy/scripts/test-arkaios.ts:15:20)
+    at async main (/workspace/arkaios-service-proxy/scripts/test-arkaios.ts:51:5) {
+  status: undefined,
+  headers: undefined,
+  requestID: undefined,
+  error: undefined,
+  code: undefined,
+  param: undefined,
+  type: undefined,
+  cause: TypeError: fetch failed
+      at node:internal/deps/undici/undici:13510:13
+      at process.processTicksAndRejections (node:internal/process/task_queues:105:5)
+      at async OpenAI.fetchWithTimeout (/workspace/arkaios-service-proxy/node_modules/openai/src/client.ts:795:14)
+      at async OpenAI.makeRequest (/workspace/arkaios-service-proxy/node_modules/openai/src/client.ts:626:22)
+      at async runSmokeTest (/workspace/arkaios-service-proxy/scripts/test-arkaios.ts:15:20)
+      at async main (/workspace/arkaios-service-proxy/scripts/test-arkaios.ts:51:5) {
+    [cause]: AggregateError [ENETUNREACH]: 
+        at internalConnectMultiple (node:net:1134:18)
+        at internalConnectMultiple (node:net:1210:5)
+        at internalConnectMultiple (node:net:1210:5)
+        at defaultTriggerAsyncIdScope (node:internal/async_hooks:464:18)
+        at GetAddrInfoReqWrap.emitLookup [as callback] (node:net:1552:7)
+        at GetAddrInfoReqWrap.onlookupall [as oncomplete] (node:dns:134:8) {
+      code: 'ENETUNREACH',
+      [errors]: [Array]
+    }
+  }
+}
