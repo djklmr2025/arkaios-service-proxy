@@ -3,6 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import morgan from 'morgan';
 import fetch from 'node-fetch';
+import { Buffer } from 'node:buffer';
 
 const app = express();
 app.use(cors());
@@ -36,10 +37,23 @@ const {
   // LAB MCP (wrapper HTTP)
   LAB_MCP_BASE_URL,
   LAB_MCP_PATH = '/mcp/run',
-  LAB_MCP_RESP_PATH = 'result.text|data.text|text|reply|response'
+  LAB_MCP_RESP_PATH = 'result.text|data.text|text|reply|response',
+
+  // Backup / Restore
+  BACKUP_BASE_URL,
+  BACKUP_INTERNAL_KEY,
+  BACKUP_PATH = '/backup/export',
+  RESTORE_BASE_URL,
+  RESTORE_INTERNAL_KEY,
+  RESTORE_PATH = '/backup/restore',
+  BACKUP_TIMEOUT_MS = '60000'
 } = process.env;
 
 const asBool = v => String(v || '').toLowerCase() === 'true';
+const asTimeout = ms => {
+  const parsed = Number.parseInt(ms, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 60000;
+};
 
 /* ---------- Auth SOLO /v1/* ---------- */
 const authMiddleware = (req, res, next) => {
@@ -66,6 +80,55 @@ const pickPath = (obj, pathStr) => {
   return undefined;
 };
 const trimBase = b => (b || '').replace(/\/+$/, '');
+const buildUrl = (base, path, query = {}) => {
+  const baseTrim = trimBase(base);
+  if (!baseTrim) return '';
+  const raw = `${baseTrim}${path.startsWith('/') ? path : `/${path}`}`;
+  const url = new URL(raw);
+  const entries = Object.entries(query || {});
+  for (const [key, value] of entries) {
+    if (Array.isArray(value)) {
+      for (const v of value) url.searchParams.append(key, v);
+    } else if (value !== undefined && value !== null) {
+      url.searchParams.append(key, value);
+    }
+  }
+  return url.toString();
+};
+
+async function forwardPost({ base, path, key, body, query, timeoutMs, contentType }) {
+  const url = buildUrl(base, path, query);
+  if (!url) throw new Error('Missing base URL');
+
+  const headers = key ? { authorization: `Bearer ${key}` } : {};
+  let payload;
+  if (Buffer.isBuffer(body)) {
+    payload = body;
+  } else if (typeof body === 'string') {
+    payload = body;
+    if (contentType) headers['content-type'] = contentType;
+  } else if (body && typeof body === 'object') {
+    payload = JSON.stringify(body);
+    headers['content-type'] = headers['content-type'] || 'application/json';
+  } else if (contentType) {
+    headers['content-type'] = contentType;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: payload,
+      signal: controller.signal,
+    });
+    const buffer = Buffer.from(await response.arrayBuffer());
+    return { response, buffer, url };
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /* ---------- Backends ---------- */
 function pick(modelId) {
@@ -384,6 +447,75 @@ app.get('/debug/ping', async (_req, res) => {
 
 /* ---------- Rutas libres ---------- */
 app.get('/', (_req, res) => res.send('ARKAIOS Service Proxy (OpenAI compatible). Ready.'));
+app.get('/v1/healthz', (_req, res) => res.json({ ok: true, scope: 'auth' }));
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
+
+/* ---------- Backup & Restore ---------- */
+app.post('/v1/backup/export', async (req, res) => {
+  if (!BACKUP_BASE_URL) return res.status(500).json({ error: 'Missing BACKUP_BASE_URL' });
+  try {
+    const { response, buffer, url } = await forwardPost({
+      base: BACKUP_BASE_URL,
+      path: BACKUP_PATH,
+      key: BACKUP_INTERNAL_KEY,
+      body: req.body,
+      query: req.query,
+      timeoutMs: asTimeout(BACKUP_TIMEOUT_MS),
+      contentType: req.headers['content-type'],
+    });
+
+    if (!response.ok) {
+      return res
+        .status(response.status)
+        .json({ error: `Backup service ${response.status} @ ${url}`, body: buffer.toString('utf8', 0, 600) });
+    }
+
+    const contentType = response.headers.get('content-type') || 'application/octet-stream';
+    const disposition = response.headers.get('content-disposition');
+    if (contentType) res.setHeader('content-type', contentType);
+    if (disposition) res.setHeader('content-disposition', disposition);
+
+    if (contentType.includes('application/json')) {
+      return res.send(buffer.toString('utf8'));
+    }
+    return res.send(buffer);
+  } catch (error) {
+    const message = error?.name === 'AbortError' ? 'Backup service timeout reached' : String(error?.message || error);
+    res.status(500).json({ error: message });
+  }
+});
+
+app.post('/v1/backup/restore', async (req, res) => {
+  const base = RESTORE_BASE_URL || BACKUP_BASE_URL;
+  if (!base) return res.status(500).json({ error: 'Missing RESTORE_BASE_URL or BACKUP_BASE_URL' });
+  try {
+    const { response, buffer, url } = await forwardPost({
+      base,
+      path: RESTORE_PATH || BACKUP_PATH,
+      key: RESTORE_INTERNAL_KEY || BACKUP_INTERNAL_KEY,
+      body: req.body,
+      query: req.query,
+      timeoutMs: asTimeout(BACKUP_TIMEOUT_MS),
+      contentType: req.headers['content-type'],
+    });
+
+    const text = buffer.toString('utf8');
+    if (!response.ok) {
+      return res
+        .status(response.status)
+        .json({ error: `Restore service ${response.status} @ ${url}`, body: text.slice(0, 600) });
+    }
+
+    const contentType = response.headers.get('content-type') || 'application/json';
+    res.setHeader('content-type', contentType);
+    if (contentType.includes('application/json')) {
+      return res.send(text);
+    }
+    return res.send(buffer);
+  } catch (error) {
+    const message = error?.name === 'AbortError' ? 'Restore service timeout reached' : String(error?.message || error);
+    res.status(500).json({ error: message });
+  }
+});
 
 app.listen(PORT, () => console.log(`Proxy on :${PORT}`));
