@@ -13,8 +13,8 @@ RUN npm install
 # Copia el resto de la aplicación
 COPY . .
 
-# Expón el puerto que usas en el server.js (ej: 3000)
-EXPOSE 3000
+# Expón el puerto que usas en el server.js (por defecto 4000)
+EXPOSE 4000
 
 # Comando para arrancar la app
 CMD ["node", "server.js"]

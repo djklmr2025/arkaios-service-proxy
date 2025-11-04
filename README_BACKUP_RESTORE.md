@@ -29,6 +29,7 @@ Este documento describe cómo exponer las operaciones de **backup** y **restore*
 |--------|------|-------------|
 | `POST` | `/v1/backup/export` | Ejecuta el proceso de backup y devuelve el artefacto recibido (por ejemplo un `.tar.gz`). |
 | `POST` | `/v1/backup/restore` | Reenvía el payload recibido al servicio de restore. Útil para cargar un backup previamente generado. |
+| `POST` | `/v1/backup/restore/raw` | Acepta binarios grandes (application/octet-stream) y los reenvía tal cual al backend. |
 | `GET` | `/v1/healthz` | Health check autenticado (útil para monitoreo interno y validar API key). |
 | `GET` | `/healthz` | Health check público sin autenticación. |
 
@@ -58,6 +59,18 @@ curl -X POST \
 ```
 
 El cuerpo enviado se reenvía tal cual al servicio de restore. Si tu backend espera multipart/form-data puedes adaptar el fetch o enviar los campos correspondientes desde el cliente.
+
+### 3. Restaurar binario crudo (recomendado para archivos grandes)
+
+```bash
+curl -X POST \
+  https://arkaios-service-proxy.example.com/v1/backup/restore/raw \
+  -H "Authorization: Bearer $ARKAIOS_PROXY_KEY" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @arkaios-backup.tar.gz
+```
+
+Este endpoint acepta cargas grandes (hasta ~200MB por defecto) y preserva el `Content-Type` al reenviar el buffer al servicio de restore.
 
 ## Seguridad
 

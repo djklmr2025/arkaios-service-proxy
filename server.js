@@ -7,7 +7,8 @@ import { Buffer } from 'node:buffer';
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '2mb' }));
+// Aumentamos el límite para permitir payloads grandes (p.ej. metadatos de backups)
+app.use(express.json({ limit: '50mb' }));
 app.use(morgan('dev'));
 
 const {
@@ -481,6 +482,40 @@ app.post('/v1/backup/export', async (req, res) => {
     return res.send(buffer);
   } catch (error) {
     const message = error?.name === 'AbortError' ? 'Backup service timeout reached' : String(error?.message || error);
+    res.status(500).json({ error: message });
+  }
+});
+
+// Restore en crudo (binarios grandes), reenvía el buffer tal cual
+app.post('/v1/backup/restore/raw', express.raw({ type: '*/*', limit: '200mb' }), async (req, res) => {
+  const base = RESTORE_BASE_URL || BACKUP_BASE_URL;
+  if (!base) return res.status(500).json({ error: 'Missing RESTORE_BASE_URL or BACKUP_BASE_URL' });
+  try {
+    const { response, buffer, url } = await forwardPost({
+      base,
+      path: RESTORE_PATH || BACKUP_PATH,
+      key: RESTORE_INTERNAL_KEY || BACKUP_INTERNAL_KEY,
+      body: req.body, // Buffer
+      query: req.query,
+      timeoutMs: asTimeout(BACKUP_TIMEOUT_MS),
+      contentType: req.headers['content-type'] || 'application/octet-stream',
+    });
+
+    const text = buffer.toString('utf8');
+    if (!response.ok) {
+      return res
+        .status(response.status)
+        .json({ error: `Restore service ${response.status} @ ${url}`, body: text.slice(0, 600) });
+    }
+
+    const contentType = response.headers.get('content-type') || 'application/json';
+    res.setHeader('content-type', contentType);
+    if (contentType.includes('application/json')) {
+      return res.send(text);
+    }
+    return res.send(buffer);
+  } catch (error) {
+    const message = error?.name === 'AbortError' ? 'Restore service timeout reached' : String(error?.message || error);
     res.status(500).json({ error: message });
   }
 });
