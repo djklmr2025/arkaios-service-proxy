@@ -10,6 +10,8 @@ app.use(cors());
 // Aumentamos el límite para permitir payloads grandes (p.ej. metadatos de backups)
 app.use(express.json({ limit: '50mb' }));
 app.use(morgan('dev'));
+// Almacenamiento en memoria del último snapshot JSON (opcional)
+let latestSnapshot = null;
 
 const {
   PORT = 4000,
@@ -452,6 +454,26 @@ app.get('/v1/healthz', (_req, res) => res.json({ ok: true, scope: 'auth' }));
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
 /* ---------- Backup & Restore ---------- */
+// Almacenar el snapshot en el propio proxy (JSON). Útil cuando no hay servicio externo.
+// Este endpoint acepta un payload JSON (puede venir con {snapshot: {...}} o el snapshot directo) y lo guarda en memoria.
+app.post('/v1/backup/store', async (req, res) => {
+  try {
+    const body = req.body || {};
+    // Permitir tanto { snapshot: {...} } como el objeto directo de snapshot
+    latestSnapshot = body.snapshot || body;
+    const approxSize = Buffer.byteLength(JSON.stringify(latestSnapshot || {}), 'utf8');
+    return res.json({ ok: true, stored: true, ts: Date.now(), approx_size_bytes: approxSize });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: String(error?.message || error) });
+  }
+});
+
+// Recuperar el último snapshot guardado
+app.get('/v1/backup/latest', (_req, res) => {
+  if (!latestSnapshot) return res.status(404).json({ ok: false, error: 'no_snapshot' });
+  return res.json(latestSnapshot);
+});
+
 app.post('/v1/backup/export', async (req, res) => {
   if (!BACKUP_BASE_URL) return res.status(500).json({ error: 'Missing BACKUP_BASE_URL' });
   try {
