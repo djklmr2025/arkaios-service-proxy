@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test:arkaios": "tsx scripts/test-arkaios.ts"
+    "test:arkaios": "tsx scripts/test-arkaios.ts",
+    "test:backup-restore": "tsx scripts/test-backup-restore.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",
