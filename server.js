@@ -575,4 +575,163 @@ app.post('/v1/backup/restore', async (req, res) => {
   }
 });
 
+      /* ---------- REMOTE DESKTOP / SCREEN CAPTURE ---------- */
+// In-memory storage para sesiones remotas y frames
+const remoteSessions = new Map(); // sessionId -> { startTime, lastFrame, status }
+const remoteFrames = new Map(); // sessionId -> { frameData, width, height, timestamp }
+
+// Iniciar una sesión de captura remota
+app.post('/v1/remote/session/start', (req, res) => {
+  try {
+    const { sessionId, clientType } = req.body || {};
+    if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
+    
+    remoteSessions.set(sessionId, {
+      startTime: Date.now(),
+      clientType,
+      status: 'active',
+      frameCount: 0
+    });
+    
+    console.log(`[Remote] Sesión iniciada: ${sessionId} (${clientType})`);
+    res.json({ ok: true, sessionId, startTime: Date.now() });
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+// Recibir frame de pantalla desde la extensión
+app.post('/v1/remote/frame', (req, res) => {
+  try {
+    const { sessionId, frameData, width, height, timestamp } = req.body || {};
+    if (!sessionId || !frameData) return res.status(400).json({ error: 'Missing sessionId or frameData' });
+    
+    const session = remoteSessions.get(sessionId);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+    
+    // Guardar frame (solo el último para no saturar memoria)
+    remoteFrames.set(sessionId, {
+      frameData,
+      width,
+      height,
+      timestamp,
+      receivedAt: Date.now()
+    });
+    
+    // Actualizar conteo en sesión
+    session.frameCount = (session.frameCount || 0) + 1;
+    session.lastFrame = Date.now();
+    
+    res.json({ ok: true, frameId: sessionId, size: frameData.length });
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+// Obtener último frame capturado (para que el agente lo vea)
+app.get('/v1/remote/last-frame', (req, res) => {
+  try {
+    const { sessionId } = req.query;
+    if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
+    
+    const frame = remoteFrames.get(sessionId);
+    if (!frame) return res.status(404).json({ error: 'No frames available for this session' });
+    
+    const session = remoteSessions.get(sessionId);
+    const uptime = session ? (Date.now() - session.startTime) / 1000 : 0;
+    
+    res.json({
+      ok: true,
+      frame: {
+        data: frame.frameData,
+        width: frame.width,
+        height: frame.height,
+        capturedAt: frame.timestamp,
+        receivedAt: frame.receivedAt
+      },
+      session: {
+        sessionId,
+        status: session?.status || 'unknown',
+        uptimeSeconds: uptime,
+        frameCount: session?.frameCount || 0
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+// Enviar acción (click, teclas, etc.) de vuelta a la extensión
+app.post('/v1/remote/action', (req, res) => {
+  try {
+    const { sessionId, action, selector, value, x, y } = req.body || {};
+    if (!sessionId || !action) return res.status(400).json({ error: 'Missing sessionId or action' });
+    
+    const session = remoteSessions.get(sessionId);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+    
+    // En un escenario real, aquí guardaríamos la acción en una queue
+    // que la extensión polléa periodicamente
+    // Por ahora, solo registramos y respondemos
+    
+    console.log(`[Remote] Acción: ${action} en sesión ${sessionId}`);
+    
+    res.json({
+      ok: true,
+      action,
+      sessionId,
+      executedAt: Date.now()
+    });
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+// Estado de sesión remota
+app.get('/v1/remote/status/:sessionId', (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const session = remoteSessions.get(sessionId);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+    
+    const frame = remoteFrames.get(sessionId);
+    const uptime = (Date.now() - session.startTime) / 1000;
+    
+    res.json({
+      ok: true,
+      sessionId,
+      status: session.status,
+      clientType: session.clientType,
+      uptimeSeconds: uptime,
+      frameCount: session.frameCount,
+      lastFrameAt: session.lastFrame,
+      hasFrame: !!frame,
+      frameDimensions: frame ? { width: frame.width, height: frame.height } : null
+    });
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+// Limpiar sesión
+app.post('/v1/remote/session/stop/:sessionId', (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    
+    if (remoteSessions.has(sessionId)) {
+      remoteSessions.delete(sessionId);
+    }
+    if (remoteFrames.has(sessionId)) {
+      remoteFrames.delete(sessionId);
+    }
+    
+    console.log(`[Remote] Sesión detenida: ${sessionId}`);
+    res.json({ ok: true, message: 'Session terminated' });
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+/* ---------- END REMOTE DESKTOP ---------- */
+
 app.listen(PORT, () => console.log(`Proxy on :${PORT}`));
