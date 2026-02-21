@@ -29,7 +29,7 @@ const {
   AIDA_BASE_URL,
   AIDA_INTERNAL_KEY,
   AIDA_PUBLIC_KEY,
-  AIDA_AUTH_MODE = 'public',      // public | internal
+  AIDA_AUTH_MODE = 'internal',    // public | internal
   AIDA_OPENAI = 'false',
   AIDA_MODE = 'gateway',          // gateway | custom | openai
   AIDA_PATH = '/aida/gateway',
