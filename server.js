@@ -89,6 +89,12 @@ const pickPath = (obj, pathStr) => {
   }
   return undefined;
 };
+const buildDegradedText = (promptText = '') => [
+  'Servicio temporalmente saturado (rate-limit en proveedores).',
+  'Tu solicitud fue recibida y el sistema esta en modo degradado.',
+  `Prompt: ${promptText || '(vacio)'}`,
+  'Sugerencia: reintentar en 30-90 segundos.',
+].join('\n');
 const trimBase = b => (b || '').replace(/\/+$/, '');
 const buildUrl = (base, path, query = {}) => {
   const baseTrim = trimBase(base);
@@ -406,7 +412,13 @@ app.post('/v1/chat/completions', async (req, res) => {
     // ---- LAB MCP wrapper ----
     if (b.name === 'lab' && b.mode === 'mcp') {
       const { ok, status, text, url } = await callMCP({ base: b.base, path: b.path, payload: last });
-      if (!ok) return res.status(502).json({ error: `Backend lab ${status} @ ${url}`, body: text.slice(0, 600) });
+      if (!ok) {
+        // Si LAB esta protegido/saturado, devolver degradado en 200 y no romper flujo.
+        if (Number(status) === 429 || Number(status) === 403) {
+          return res.json(toOpenAIChat(buildDegradedText(last)));
+        }
+        return res.status(502).json({ error: `Backend lab ${status} @ ${url}`, body: text.slice(0, 600) });
+      }
       let out = text;
       try {
         const j = JSON.parse(text);
@@ -528,7 +540,17 @@ app.post('/v1/completions', async (req, res) => {
 
     if (b.name === 'lab' && b.mode === 'mcp') {
       const { ok, status, text, url } = await callMCP({ base: b.base, path: b.path, payload: prompt });
-      if (!ok) return res.status(502).json({ error: `Backend lab ${status} @ ${url}`, body: text.slice(0, 600) });
+      if (!ok) {
+        // Si LAB esta protegido/saturado, devolver degradado en 200 y no romper flujo.
+        if (Number(status) === 429 || Number(status) === 403) {
+          return res.json({
+            id: 'proxy-txt',
+            object: 'text_completion',
+            choices: [{ index: 0, text: buildDegradedText(prompt), finish_reason: 'stop' }],
+          });
+        }
+        return res.status(502).json({ error: `Backend lab ${status} @ ${url}`, body: text.slice(0, 600) });
+      }
       let out = text;
       try {
         const j = JSON.parse(text);
@@ -610,7 +632,13 @@ app.get('/debug/ping', async (_req, res) => {
   }
   res.json({
     arkaios: await probe('arkaios', ARKAIOS_BASE_URL),
-    aida: await probe('aida', AIDA_BASE_URL)
+    aida: await probe('aida', AIDA_BASE_URL),
+    lab: await (async () => {
+      const l = pick('lab');
+      if (!l.base || l.mode !== 'mcp') return { name: 'lab', ok: false, error: 'not_configured' };
+      const { ok, status, text, url } = await callMCP({ base: l.base, path: l.path, payload: 'ping' });
+      return { name: 'lab', ok, status, url, body: String(text || '').slice(0, 400) };
+    })(),
   });
 });
 
