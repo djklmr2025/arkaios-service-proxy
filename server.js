@@ -275,6 +275,46 @@ function toOpenAIChat(text) {
   };
 }
 
+async function fallbackArkaiosToAida(lastPrompt) {
+  const a = pick('aida');
+  if (!a.base || a.mode !== 'gateway') {
+    return { ok: false, reason: 'aida_gateway_unavailable' };
+  }
+
+  const url = `${a.base}${a.path.startsWith('/') ? a.path : `/${a.path}`}`;
+  const authKey = a.authMode === 'public' ? a.keyPublic : a.keyInternal;
+  const body = { agent_id: a.agentId, action: a.action, params: { [a.objectiveField]: lastPrompt } };
+
+  const r = await fetchWithRetry(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(authKey ? { authorization: `Bearer ${authKey}` } : {}) },
+    body: JSON.stringify(body),
+  }, 'aida-fallback');
+
+  const txt = await r.text();
+  if (!r.ok) return { ok: false, status: r.status, body: txt.slice(0, 600) };
+
+  let out = txt;
+  try {
+    const j = JSON.parse(txt);
+    const objective = dotGet(j, `result.params.${a.objectiveField}`) || dotGet(j, `params.${a.objectiveField}`);
+    const picked = pickPath(j, AIDA_RESP_PATH) || j?.content;
+    const steps = dotGet(j, 'result.steps') || dotGet(j, 'steps') || dotGet(j, 'result.plan') || dotGet(j, 'plan');
+    const note = dotGet(j, 'result.note') || j?.note || dotGet(j, 'data.text') || j?.text;
+    const parts = [];
+    if (objective) parts.push(`Objetivo: ${objective}`);
+    if (typeof picked === 'string' && picked) parts.push(picked);
+    else if (note) parts.push(`${note}`);
+    if (Array.isArray(steps) && steps.length) {
+      const list = steps.map((s, i) => `${i + 1}. ${typeof s === 'string' ? s : JSON.stringify(s)}`).join('\n');
+      parts.push(list);
+    }
+    out = parts.length ? parts.join('\n') : (typeof picked === 'string' ? picked : JSON.stringify(j));
+  } catch {}
+
+  return { ok: true, text: out };
+}
+
 /* ---------- /v1/models ---------- */
 app.get('/v1/models', (_req, res) => {
   res.json({
@@ -378,7 +418,21 @@ app.post('/v1/chat/completions', async (req, res) => {
     const { ok, status, text, url } = await callCustom({
       base: b.base, path: b.path, key: k, reqField: b.reqField, payload: last
     });
-    if (!ok) return res.status(502).json({ error: `Backend ${b.name} ${status} @ ${url}`, body: text.slice(0, 600) });
+    if (!ok) {
+      // Degradacion controlada: si arkaios esta rate-limited, intentar AIDA gateway.
+      if (b.name === 'arkaios' && status === 429) {
+        const fb = await fallbackArkaiosToAida(last);
+        if (fb.ok) {
+          return res.json(toOpenAIChat(fb.text));
+        }
+        return res.status(502).json({
+          error: `Backend ${b.name} ${status} @ ${url}`,
+          body: text.slice(0, 600),
+          fallback_error: fb,
+        });
+      }
+      return res.status(502).json({ error: `Backend ${b.name} ${status} @ ${url}`, body: text.slice(0, 600) });
+    }
 
     let out = text;
     try {
