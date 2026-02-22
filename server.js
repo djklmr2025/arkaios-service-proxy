@@ -16,6 +16,9 @@ let latestSnapshot = null;
 const {
   PORT = 4000,
   PROXY_API_KEY,
+  UPSTREAM_MAX_ATTEMPTS = '4',
+  UPSTREAM_RETRY_BASE_MS = '700',
+  UPSTREAM_RETRY_MAX_MS = '8000',
 
   // ARKAIOS
   ARKAIOS_BASE_URL,
@@ -56,6 +59,10 @@ const asBool = v => String(v || '').toLowerCase() === 'true';
 const asTimeout = ms => {
   const parsed = Number.parseInt(ms, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 60000;
+};
+const asInt = (value, fallback) => {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 };
 
 /* ---------- Auth SOLO /v1/* ---------- */
@@ -98,6 +105,51 @@ const buildUrl = (base, path, query = {}) => {
   }
   return url.toString();
 };
+
+const shouldRetryStatus = status => status === 429 || (status >= 500 && status <= 599);
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const retryAfterMs = response => {
+  const raw = response?.headers?.get?.('retry-after');
+  if (!raw) return null;
+  const sec = Number.parseFloat(raw);
+  if (Number.isFinite(sec) && sec > 0) return Math.round(sec * 1000);
+  const dateMs = Date.parse(raw);
+  if (Number.isFinite(dateMs)) {
+    const diff = dateMs - Date.now();
+    return diff > 0 ? diff : null;
+  }
+  return null;
+};
+
+async function fetchWithRetry(url, init = {}, label = 'upstream') {
+  const maxAttempts = asInt(UPSTREAM_MAX_ATTEMPTS, 4);
+  const baseDelay = asInt(UPSTREAM_RETRY_BASE_MS, 700);
+  const maxDelay = asInt(UPSTREAM_RETRY_MAX_MS, 8000);
+
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const res = await fetch(url, init);
+      if (!shouldRetryStatus(res.status) || attempt === maxAttempts) return res;
+
+      const hinted = retryAfterMs(res);
+      const backoff = Math.min(maxDelay, baseDelay * 2 ** (attempt - 1));
+      const jitter = Math.floor(Math.random() * 250);
+      const waitMs = Math.max(hinted || 0, backoff + jitter);
+      console.warn(`[${label}] retry ${attempt}/${maxAttempts} status=${res.status} wait=${waitMs}ms`);
+      await sleep(waitMs);
+    } catch (error) {
+      lastError = error;
+      if (attempt === maxAttempts) throw error;
+      const backoff = Math.min(maxDelay, baseDelay * 2 ** (attempt - 1));
+      const jitter = Math.floor(Math.random() * 250);
+      const waitMs = backoff + jitter;
+      console.warn(`[${label}] retry ${attempt}/${maxAttempts} error=${String(error?.message || error)} wait=${waitMs}ms`);
+      await sleep(waitMs);
+    }
+  }
+  throw lastError || new Error('Unknown upstream error');
+}
 
 async function forwardPost({ base, path, key, body, query, timeoutMs, contentType }) {
   const url = buildUrl(base, path, query);
@@ -183,21 +235,21 @@ async function callOpenAI({ base, key, modelName, messages, prompt, stream }) {
   const url = `${base}/v1/chat/completions`;
   const body = messages ? { model: modelName, messages, stream: !!stream }
                         : { model: modelName, prompt, stream: !!stream };
-  return fetch(url, {
+  return fetchWithRetry(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(key ? { authorization: `Bearer ${key}` } : {}) },
     body: JSON.stringify(body),
-  });
+  }, `openai:${modelName}`);
 }
 
 async function callCustom({ base, path, key, reqField, payload }) {
   const url = `${base}${path.startsWith('/') ? path : `/${path}`}`;
   const body = { [reqField]: payload, model: 'custom' };
-  const r = await fetch(url, {
+  const r = await fetchWithRetry(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(key ? { authorization: `Bearer ${key}` } : {}) },
     body: JSON.stringify(body),
-  });
+  }, 'custom');
   const text = await r.text();
   return { ok: r.ok, status: r.status, text, url };
 }
@@ -206,11 +258,11 @@ async function callCustom({ base, path, key, reqField, payload }) {
 async function callMCP({ base, path, payload }) {
   const url = `${base}${path.startsWith('/') ? path : `/${path}`}`;
   const body = { command: 'arkaios.chat', params: { prompt: payload } };
-  const r = await fetch(url, {
+  const r = await fetchWithRetry(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
-  });
+  }, 'mcp');
   const text = await r.text();
   return { ok: r.ok, status: r.status, text, url };
 }
@@ -263,11 +315,11 @@ app.post('/v1/chat/completions', async (req, res) => {
       const authKey = b.authMode === 'public' ? b.keyPublic : b.keyInternal;
       const body = { agent_id: b.agentId, action: b.action, params: { [b.objectiveField]: last } };
 
-      const r = await fetch(url, {
+      const r = await fetchWithRetry(url, {
         method: 'POST',
         headers: { 'content-type': 'application/json', ...(authKey ? { authorization: `Bearer ${authKey}` } : {}) },
         body: JSON.stringify(body),
-      });
+      }, 'aida-gateway');
 
       const txt = await r.text();
       if (!r.ok) return res.status(502).json({ error: `Backend aida ${r.status} @ ${url}`, body: txt.slice(0, 600) });
@@ -359,11 +411,11 @@ app.post('/v1/completions', async (req, res) => {
       const authKey = b.authMode === 'public' ? b.keyPublic : b.keyInternal;
       const body = { agent_id: b.agentId, action: b.action, params: { [b.objectiveField]: prompt } };
 
-      const r = await fetch(url, {
+      const r = await fetchWithRetry(url, {
         method: 'POST',
         headers: { 'content-type': 'application/json', ...(authKey ? { authorization: `Bearer ${authKey}` } : {}) },
         body: JSON.stringify(body),
-      });
+      }, 'aida-gateway');
       const txt = await r.text();
       if (!r.ok) return res.status(502).json({ error: `Backend aida ${r.status} @ ${url}`, body: txt.slice(0, 600) });
 
