@@ -425,6 +425,16 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (fb.ok) {
           return res.json(toOpenAIChat(fb.text));
         }
+        // Si ambos proveedores estan rate-limited, responder degradado en 200 para no romper flujo.
+        if (Number(fb.status) === 429) {
+          const degraded = [
+            'Servicio temporalmente saturado (rate-limit en proveedores).',
+            'Tu solicitud fue recibida y el sistema esta en modo degradado.',
+            `Prompt: ${last || '(vacio)'}`,
+            'Sugerencia: reintentar en 30-90 segundos.',
+          ].join('\n');
+          return res.json(toOpenAIChat(degraded));
+        }
         return res.status(502).json({
           error: `Backend ${b.name} ${status} @ ${url}`,
           body: text.slice(0, 600),
