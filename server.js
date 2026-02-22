@@ -315,6 +315,24 @@ async function fallbackArkaiosToAida(lastPrompt) {
   return { ok: true, text: out };
 }
 
+async function fallbackArkaiosToLab(lastPrompt) {
+  const l = pick('lab');
+  if (!l.base || l.mode !== 'mcp') {
+    return { ok: false, reason: 'lab_mcp_unavailable' };
+  }
+
+  const { ok, status, text, url } = await callMCP({ base: l.base, path: l.path, payload: lastPrompt });
+  if (!ok) return { ok: false, status, body: text.slice(0, 600), url };
+
+  let out = text;
+  try {
+    const j = JSON.parse(text);
+    const picked = pickPath(j, l.respPath);
+    out = typeof picked === 'string' ? picked : (j.text || j.reply || j.response || j.content || JSON.stringify(j));
+  } catch {}
+  return { ok: true, text: out };
+}
+
 /* ---------- /v1/models ---------- */
 app.get('/v1/models', (_req, res) => {
   res.json({
@@ -425,8 +443,12 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (fb.ok) {
           return res.json(toOpenAIChat(fb.text));
         }
+        const fl = await fallbackArkaiosToLab(last);
+        if (fl.ok) {
+          return res.json(toOpenAIChat(fl.text));
+        }
         // Si ambos proveedores estan rate-limited, responder degradado en 200 para no romper flujo.
-        if (Number(fb.status) === 429) {
+        if (Number(fb.status) === 429 && Number(fl.status || 429) === 429) {
           const degraded = [
             'Servicio temporalmente saturado (rate-limit en proveedores).',
             'Tu solicitud fue recibida y el sistema esta en modo degradado.',
@@ -439,6 +461,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           error: `Backend ${b.name} ${status} @ ${url}`,
           body: text.slice(0, 600),
           fallback_error: fb,
+          fallback_lab_error: fl,
         });
       }
       return res.status(502).json({ error: `Backend ${b.name} ${status} @ ${url}`, body: text.slice(0, 600) });
@@ -518,7 +541,34 @@ app.post('/v1/completions', async (req, res) => {
     const { ok, status, text, url } = await callCustom({
       base: b.base, path: b.path, key: b.keyInternal, reqField: b.reqField, payload: prompt
     });
-    if (!ok) return res.status(502).json({ error: `Backend ${b.name} ${status} @ ${url}`, body: text.slice(0, 600) });
+    if (!ok) {
+      if (b.name === 'arkaios' && status === 429) {
+        const fb = await fallbackArkaiosToAida(prompt);
+        if (fb.ok) {
+          return res.json({ id: 'proxy-txt', object: 'text_completion', choices: [{ index: 0, text: fb.text, finish_reason: 'stop' }] });
+        }
+        const fl = await fallbackArkaiosToLab(prompt);
+        if (fl.ok) {
+          return res.json({ id: 'proxy-txt', object: 'text_completion', choices: [{ index: 0, text: fl.text, finish_reason: 'stop' }] });
+        }
+        if (Number(fb.status) === 429 && Number(fl.status || 429) === 429) {
+          const degraded = [
+            'Servicio temporalmente saturado (rate-limit en proveedores).',
+            'Tu solicitud fue recibida y el sistema esta en modo degradado.',
+            `Prompt: ${prompt || '(vacio)'}`,
+            'Sugerencia: reintentar en 30-90 segundos.',
+          ].join('\n');
+          return res.json({ id: 'proxy-txt', object: 'text_completion', choices: [{ index: 0, text: degraded, finish_reason: 'stop' }] });
+        }
+        return res.status(502).json({
+          error: `Backend ${b.name} ${status} @ ${url}`,
+          body: text.slice(0, 600),
+          fallback_error: fb,
+          fallback_lab_error: fl,
+        });
+      }
+      return res.status(502).json({ error: `Backend ${b.name} ${status} @ ${url}`, body: text.slice(0, 600) });
+    }
 
     let out = text;
     try {
