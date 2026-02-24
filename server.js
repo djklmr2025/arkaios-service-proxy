@@ -333,8 +333,13 @@ async function fallbackArkaiosToLab(lastPrompt) {
   let out = text;
   try {
     const j = JSON.parse(text);
-    const picked = pickPath(j, l.respPath);
-    out = typeof picked === 'string' ? picked : (j.text || j.reply || j.response || j.content || JSON.stringify(j));
+    const picked = pickPath(j, `${l.respPath}|result.reply.message|reply.message|message`);
+    const via = dotGet(j, 'result.via') || j.via;
+    if (via === 'degraded') {
+      out = typeof picked === 'string' && picked.trim() ? picked : buildDegradedText(lastPrompt);
+    } else {
+      out = typeof picked === 'string' ? picked : (j.text || j.reply || j.response || j.content || JSON.stringify(j));
+    }
   } catch {}
   return { ok: true, text: out };
 }
@@ -426,9 +431,13 @@ app.post('/v1/chat/completions', async (req, res) => {
         const origin = dotGet(j, 'result.via') || j.via || undefined;
         const payload = dotGet(j, 'result.reply') || j.reply || j.result || j;
         const objective = dotGet(payload, 'result.params.objective') || dotGet(payload, 'params.objective');
-        const picked = pickPath(payload, b.respPath) || payload?.content;
+        const picked = pickPath(payload, `${b.respPath}|message|result.message|reply.message`) || payload?.content;
         const steps = dotGet(payload, 'result.steps') || dotGet(payload, 'steps') || dotGet(payload, 'result.plan') || dotGet(payload, 'plan');
         const note = dotGet(payload, 'result.note') || payload?.note || dotGet(payload, 'data.text') || payload?.text;
+        if (origin === 'degraded') {
+          const degraded = typeof picked === 'string' && picked.trim() ? picked : buildDegradedText(last);
+          return res.json(toOpenAIChat(degraded));
+        }
         let parts = [];
         if (objective) parts.push(`Objetivo: ${objective}`);
         if (typeof picked === 'string' && picked) parts.push(picked);
@@ -554,8 +563,14 @@ app.post('/v1/completions', async (req, res) => {
       let out = text;
       try {
         const j = JSON.parse(text);
-        const picked = pickPath(j, b.respPath);
-        out = typeof picked === 'string' ? picked : (j.text || j.reply || j.response || j.content || JSON.stringify(j));
+        const payload = dotGet(j, 'result.reply') || j.reply || j.result || j;
+        const picked = pickPath(payload, `${b.respPath}|message|result.message|reply.message`);
+        const via = dotGet(j, 'result.via') || j.via;
+        if (via === 'degraded') {
+          out = typeof picked === 'string' && picked.trim() ? picked : buildDegradedText(prompt);
+        } else {
+          out = typeof picked === 'string' ? picked : (j.text || j.reply || j.response || j.content || JSON.stringify(j));
+        }
       } catch {}
       return res.json({ id: 'proxy-txt', object: 'text_completion', choices: [{ index: 0, text: out, finish_reason: 'stop' }] });
     }
